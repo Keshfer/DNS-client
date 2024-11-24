@@ -2,6 +2,7 @@ import socket
 import random
 from io import BytesIO
 import struct
+import time
 #DNS Header
 class Header:
     def __init__(self, id: int, flags: int, QDCOUNT = 0, ANCOUNT = 0, NSCOUNT = 0, ARCOUNT = 0):
@@ -15,6 +16,8 @@ class Header:
 
     def __str__(self):
         return f"Header(id: {self.id}, flags: {self.flags}, Question count: {self.QDCOUNT}, Answer count: {self.ANCOUNT}, Authorities count: {self.NSCOUNT}, Additional count: {self.ARCOUNT})"
+    def str(self):
+        return self.__str__(self)
 #DNS Question
 class Question:
     def __init__(self, QNAME: bytes, QTYPE: int, QCLASS: int ):
@@ -24,6 +27,8 @@ class Question:
         self.QCLASS = QCLASS
     def __str__(self):
         return f"Question(QNAME: {self.QNAME}, QTYPE: {self.QTYPE}, QCLASS: {self.QCLASS})"
+    def str(self):
+        return self.__str__()
 
 #Resource Record
 class Resource_Record:
@@ -36,8 +41,33 @@ class Resource_Record:
         self.Rdata = Rdata
     
     def __str__(self):
-        return f"ResourceRecord(name: {self.name}, type: {self.type} class_data: {self.class_data}, TTL: {self.TTL}, RDlen: {self.RDlen}, self.Rdata: {self.Rdata})"
+        return f"ResourceRecord(name: {self.name}, type: {self.type} class_data: {self.class_data}, TTL: {self.TTL}, RDlen: {self.RDlen}, Rdata: {self.Rdata})"
+    def str(self):
+        return self.__str__()
+class DNSPacket:
+    def __init__(self, header: Header, questions: list[Question], answers: list[Resource_Record], authorities: list[Resource_Record], additionals: list[Resource_Record]):
+        self.header = header
+        self.questions = questions
+        self.answers = answers
+        self.authorities = authorities
+        self.additionals = additionals
+    def __str__(self):
+        questions_str = []
+        answers_str = []
+        authorities_str = []
+        additionals_str = []
+        for x in self.questions:
+            questions_str.append(x.str())
+        for x in self.answers:
+            answers_str.append(x.str())
+        for x in self.authorities:
+            authorities_str.append(x.str())
+        for x in self.additionals:
+            additionals_str.append(x.str())
 
+        return f"DNSPacket(header: {self.header},\n questions: {"\n".join(questions_str)},\n answers: {"\n".join(answers_str)},\n authorities: {"\n".join(authorities_str)},\n additionals: {"\n".join(additionals_str)})"
+    def str(self):
+        return self.__str__()
 #convert DNS Header to byte form
 def header_to_bytes(header: Header):
     id = header.id
@@ -79,6 +109,10 @@ def create_query(domain_name: str, record_type: int):
     question = Question(QNAME = name, QTYPE = record_type, QCLASS = 1 )
     query = header_to_bytes(header) + question_to_bytes(question)
     return query
+def send_query(client_socket,query, destination):
+    client_socket.sendto(query, destination)
+    response, res_addr = client_socket.recvfrom(1024)
+    return response
 
 def parse_header(buffer):
     header_shorts = struct.unpack('!HHHHHH', buffer.read(12)) # 12 bytes
@@ -86,13 +120,22 @@ def parse_header(buffer):
 
 def decode_domain_name(buffer):
     chunks = []
-    while (length := buffer.read(1)[0]) != 0: #checks to see if there are still domain name chunks to read. [0] is the byte that indicates how many character bytes there are
-        if length & 0b11000000: #performs bitwise AND to check if there is compression.
-            #length is compressed so decode it
-            chunks.append(decode_compressed_domain_name(length, buffer))
-            break # break because decode_compressed_domain_name will handle 
-        else:
-            chunks.append(buffer.read(length)) # read up to the specify length and store that name chunk in chunks
+    try:
+        while (length := buffer.read(1)[0]) != 0: #checks to see if there are still domain name chunks to read. [0] is the byte that indicates how many character bytes there are
+            if length & 0b11000000: #performs bitwise AND to check if there is compression.
+                #length is compressed so decode it
+                decoded_name = decode_compressed_domain_name(length, buffer)
+                if decoded_name != None:
+                    chunks.append(decoded_name)
+                else:
+                    return None
+                break # break because decode_compressed_domain_name will handle 
+            else:
+                chunk = buffer.read(length)
+                chunks.append(chunk) # read up to the specify length and store that name chunk in chunks
+    except IndexError:
+        print("unable to parse due to index out of range error")
+        return None
     #buffer.read will eventually reach the terminator byte and end the loop
     return b".".join(chunks)
 
@@ -102,8 +145,12 @@ def decode_compressed_domain_name(length, buffer):
     current_pos = buffer.tell()
     buffer.seek(pointer)
     decoded_name = decode_domain_name(buffer) #will perform the normal parsing (the else body of the function) of the domain name
+    #print(decoded_name)
     buffer.seek(current_pos)
-    return decoded_name
+    if decoded_name != None:
+        return decoded_name
+    else:
+        return None
 
 def parse_question(buffer):
     name = decode_domain_name(buffer)
@@ -119,6 +166,23 @@ def parse_record(buffer):
     type_, class_, TTL, RDlength = struct.unpack("!HHIH", data)
     record_data = buffer.read(RDlength)
     return Resource_Record(name = name, type = type_, class_data = class_, TTL= TTL, RDlen = RDlength, Rdata = record_data)
+
+def parse_packet(response):
+    buffer = BytesIO(response)
+    header = parse_header(buffer)
+    questions = []
+    answers =[]
+    authorities = []
+    additionals = []
+    for i in range(header.QDCOUNT):
+        questions.append(parse_question(buffer))
+    for i in range(header.ANCOUNT):
+        answers.append(parse_record(buffer))
+    for i in range(header.NSCOUNT):
+        authorities.append(parse_record(buffer))
+    for i in range(header.ARCOUNT):
+        additionals.append(parse_record(buffer))
+    return DNSPacket(header=header, questions=questions, answers=answers, authorities=authorities, additionals=additionals)
 
 def ip4_string(ip_bytes):
     num_list =[]
@@ -137,40 +201,351 @@ query = create_query("tmz.com", 1) # 1 represents the resource record of type A:
 #print(query)
 
 #create socket
-client_socket = sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 client_socket.settimeout(10)
-# for ip in root_servers:
-#     client_socket.sendto(query, (ip, 53))
-#     response, res_addr = client_socket.recvfrom(1024)
-#     #print(response)
-#     buffer = BytesIO(response)
-#     header = parse_header(buffer)
-#     print(header)
-client_socket.sendto(query, ('198.41.0.4', 53))
-response, res_addr = client_socket.recvfrom(1024)
-#print(response)
-buffer = BytesIO(response)
-header = parse_header(buffer)
-question = parse_question(buffer)
-print(header)
-print(question)
-TLD_ip = []
-print("Authority records: ")
-for i in range(header.NSCOUNT):
-    auth = parse_record(buffer)
-    print(auth)
-    if(auth.type == 2 and auth.RDlen > 4): # auth.RDlen > 4 to filter out ip addresses labelled with type 2. Also very unlikely a domain name is two letters (1 length byte + 2 char bytes + 1 terminator byte)
-        temp = BytesIO(auth.Rdata)
-        print(decode_domain_name(temp))
-    else:
-        print(ip4_string(auth.Rdata))
-print("Additional records: ")
-for i in range(header.ARCOUNT):
-    add = parse_record(buffer)
-    print(add)
-    print(add.RDlen)
-    if (add.RDlen == 4): # filtering for ipv4 addresses
-        print(ip4_string(add.Rdata))
-    else: # ipv6 addresses
-        print(ip6_string(add.Rdata))
+packet_received = False
+#seek TLDs from root servers
+start_time = time.time()
+for ip in root_servers:
+    for i in range(3):
+        try:
+            client_socket.sendto(query, (ip, 53))
+            response, res_addr = client_socket.recvfrom(1024)
+            resolver_RTT = time.time() - start_time
+            print("received")
+            packet = parse_packet(response)
+            packet_received = True
+            break
+        except TimeoutError:
+            print("time out occurred")
+            if(i == 2):
+                print("moving onto next root server IP")
+    if packet_received:
+        print("********** ROOT RESPONSE **********")
+        header = packet.header
+        questions = packet.questions
+        answers = packet.answers
+        authorities = packet.authorities
+        additionals = packet.additionals
+        TLD_list = []
+        print("HEADER")
+        print(header)
+        print("QUESTIONS")
+        for i in questions:
+            print(i)
+        print("ANSWERS")
+        for i in answers:
+            print(i)
+        print("AUTHORITIES")
+        for i in authorities:
+            print(i)
+            if(i.type ==2 and i.RDlen > 4): # auth.RDlen > 4 to filter out ip addresses labelled with type 2. Also very unlikely a domain name is two letters (1 length byte + 2 char bytes + 1 terminator byte)
+                temp = BytesIO(i.Rdata)
+                #print(bin(int.from_bytes(i.Rdata, byteorder="big")))
+                decoded_Rdata = decode_domain_name(temp)
+                if decoded_Rdata != None:
+                    print(decoded_Rdata)
+            else:
+                ip4 = ip4_string(i.Rdata)
+                print(ip4)
+                TLD_list.append(ip4)
+        print("ADDITIONALS")
+        for i in additionals:
+            print(i)
+            if (i.RDlen == 4): # filtering for ipv4 addresses
+                ip4 = ip4_string(i.Rdata)
+                print(ip4)
+                TLD_list.append(ip4)
+            else: # ipv6 addresses
+                print(ip6_string(i.Rdata))
 
+        unique_TLD = list(set(TLD_list)) # filter out duplicate IPs
+        print(unique_TLD)
+        break
+    
+#seek Authority server IPs with TLDS 
+packet_received = False
+for ip in unique_TLD:
+    for i in range(3):
+        try:
+            client_socket.sendto(query, (ip, 53))
+            response, res_addr = client_socket.recvfrom(1024)
+            print("received")
+            packet = parse_packet(response)
+            packet_received = True
+            break
+        except TimeoutError:
+            print("time out occurred")
+            if(i == 2):
+                print("moving onto next TLD server IP")
+    if packet_received:
+        print("********** TLD RESPONSE **********")
+        header = packet.header
+        questions = packet.questions
+        answers = packet.answers
+        authorities = packet.authorities
+        additionals = packet.additionals
+        authorities_list = []
+        print("HEADER")
+        print(header)
+        print("QUESTIONS")
+        for i in questions:
+            print(i)
+        print("ANSWERS")
+        for i in answers:
+            print(i)
+            ip4 = ip4_string(i.Rdata)
+            print(ip4)
+        print("AUTHORITIES")
+        for i in authorities:
+            print(i)
+            if(i.type ==2 and i.RDlen > 4): # auth.RDlen > 4 to filter out ip addresses labelled with type 2. Also very unlikely a domain name is two letters (1 length byte + 2 char bytes + 1 terminator byte)
+                temp = BytesIO(i.Rdata)
+                #print(bin(int.from_bytes(i.Rdata, byteorder="big")))
+                decoded_Rdata = decode_domain_name(temp)
+                if decoded_Rdata != None:
+                    print(decoded_Rdata)
+            else:
+                ip4 = ip4_string(i.Rdata)
+                print(ip4)
+                authorities_list.append(ip4)
+        print("ADDITIONALS")
+        for i in additionals:
+            print(i)
+            if (i.RDlen == 4): # filtering for ipv4 addresses
+                ip4 = ip4_string(i.Rdata)
+                print(ip4)
+                authorities_list.append(ip4)
+            else: # ipv6 addresses
+                print(ip6_string(i.Rdata))
+
+        unique_authorities = list(set(authorities_list)) # filter out duplicate IPs
+        print(unique_authorities)
+        break
+#seek host address IPs with Authority servers
+packet_received = False
+for ip in unique_authorities:
+    for i in range(3):
+        try:
+            client_socket.sendto(query, (ip, 53))
+            response, res_addr = client_socket.recvfrom(1024)
+            print("received")
+            packet = parse_packet(response)
+            packet_received = True
+            break
+        except:
+            print("time out occurred")
+            if(i == 2):
+                print("moving onto next Authority server IP")
+    if packet_received:
+        print("********** AUTHORITY RESPONSE **********")
+        header = packet.header
+        questions = packet.questions
+        answers = packet.answers
+        authorities = packet.authorities
+        additionals = packet.additionals
+        hosts_list = []
+        print("HEADER")
+        print(header)
+        print("QUESTIONS")
+        for i in questions:
+            print(i)
+        print("ANSWERS")
+        for i in answers:
+            print(i)
+            ip4 = ip4_string(i.Rdata)
+            print(ip4)
+            hosts_list.append(ip4)
+        print("AUTHORITIES")
+        for i in authorities:
+            print(i)
+            if(i.type ==2 and i.RDlen > 4): # auth.RDlen > 4 to filter out ip addresses labelled with type 2. Also very unlikely a domain name is two letters (1 length byte + 2 char bytes + 1 terminator byte)
+                temp = BytesIO(i.Rdata)
+                #print(bin(int.from_bytes(i.Rdata, byteorder="big")))
+                decoded_Rdata = decode_domain_name(temp)
+                if decoded_Rdata != None:
+                    print(decoded_Rdata)
+            else:
+                ip4 = ip4_string(i.Rdata)
+                print(ip4)
+        print("ADDITIONALS")
+        for i in additionals:
+            print(i)
+            if (i.RDlen == 4): # filtering for ipv4 addresses
+                ip4 = ip4_string(i.Rdata)
+                print(ip4)
+            else: # ipv6 addresses
+                print(ip6_string(i.Rdata))
+        break
+
+print('********** HOST ADDRESSES **********')
+unique_hosts = list(set(hosts_list))
+print(unique_hosts)
+client_socket.close()
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_tcp:
+    connected = False
+    start_time = time.time()
+    for ip in unique_hosts:
+        for i in range(3):
+            try:
+                client_tcp.connect((ip, 80)) # 80 is port for HTTP
+                connected = True
+                break
+            except TimeoutError:
+                print("Time out occurred")
+        if connected:
+            client_tcp.sendall(b"GET / HTTP/1.1\r\nHost:tmz.com\r\n\r\n")
+            response = client_tcp.recv(4096)
+            http_RTT = time.time() - start_time
+            print('********** HTTP RESPONSE **********')
+            print(response.decode())
+            break
+
+
+print(f"Resolver RTT: {resolver_RTT} seconds")
+print(f"HTTP RTT: {http_RTT} seconds")
+#dest = ('198.41.0.4', 53)
+#response = send_query(client_socket, query, dest)
+
+#print(response)
+# buffer = BytesIO(response)
+# header = parse_header(buffer)
+# question = parse_question(buffer)
+# print(header)
+# print(question)
+# TLD_ip = []
+# print("Authority records: ")
+# for i in range(header.NSCOUNT):
+#     auth = parse_record(buffer)
+#     print(auth)
+#     if(auth.type == 2 and auth.RDlen > 4): # auth.RDlen > 4 to filter out ip addresses labelled with type 2. Also very unlikely a domain name is two letters (1 length byte + 2 char bytes + 1 terminator byte)
+#         temp = BytesIO(auth.Rdata)
+#         print(decode_domain_name(temp))
+#     else:
+#         ip4 = ip4_string(auth.Rdata)
+#         print(ip4)
+#         TLD_ip.append(ip4_string(auth.Rdata))
+# print("Additional records: ")
+# for i in range(header.ARCOUNT):
+#     add = parse_record(buffer)
+#     print(add)
+#     if (add.RDlen == 4): # filtering for ipv4 addresses
+#         ip4 = ip4_string(auth.Rdata)
+#         print(ip4)
+#         TLD_ip.append(ip4_string(auth.Rdata))
+#     else: # ipv6 addresses
+#         print(ip6_string(add.Rdata))
+# print(TLD_ip)
+
+#packet = parse_packet(response)
+#print(packet)
+# header = packet.header
+# questions = packet.questions
+# answers = packet.answers
+# authorities = packet.authorities
+# additionals = packet.additionals
+# TLD_list = []
+# print("HEADER")
+# print(header)
+# print("QUESTIONS")
+# for i in questions:
+#     print(i)
+# print("ANSWERS")
+# for i in answers:
+#     print(i)
+# print("AUTHORITIES")
+# for i in authorities:
+#     print(i)
+#     if(i.type ==2 and i.RDlen > 4): # auth.RDlen > 4 to filter out ip addresses labelled with type 2. Also very unlikely a domain name is two letters (1 length byte + 2 char bytes + 1 terminator byte)
+#         temp = BytesIO(i.Rdata)
+#         #print(bin(int.from_bytes(i.Rdata, byteorder="big")))
+#         decoded_Rdata = decode_domain_name(temp)
+#         if decoded_Rdata != None:
+#             print(decoded_Rdata)
+#     else:
+#         ip4 = ip4_string(i.Rdata)
+#         print(ip4)
+#         TLD_list.append(ip4)
+# print("ADDITIONALS")
+# for i in additionals:
+#     print(i)
+#     if (i.RDlen == 4): # filtering for ipv4 addresses
+#         ip4 = ip4_string(i.Rdata)
+#         print(ip4)
+#         TLD_list.append(ip4)
+#     else: # ipv6 addresses
+#         print(ip6_string(i.Rdata))
+
+# unique_TLD = list(set(TLD_list)) # filter out duplicate IPs
+# print(unique_TLD)
+
+# dest = ('192.41.162.30',53)
+# response = send_query(client_socket, query, dest)
+# packet = parse_packet(response)
+# print(packet)
+# header = packet.header
+# questions = packet.questions
+# answers = packet.answers
+# authorities = packet.authorities
+# additionals = packet.additionals
+# authorities_list = []
+# print("HEADER")
+# print(header)
+# print("QUESTIONS")
+# for i in questions:
+#     print(i)
+# print("ANSWERS")
+# for i in answers:
+#     print(i)
+# print("AUTHORITIES")
+# for i in authorities:
+#     print(i)
+#     if(i.type ==2 and i.RDlen > 4): # auth.RDlen > 4 to filter out ip addresses labelled with type 2. Also very unlikely a domain name is two letters (1 length byte + 2 char bytes + 1 terminator byte)
+#         temp = BytesIO(i.Rdata)
+#         # curr = temp.tell()
+#         # data = temp.read()
+#         # print(data)
+#         # temp.seek(curr)
+#         #print(bin(int.from_bytes(i.Rdata, byteorder="big")))
+#         decoded_Rdata = decode_domain_name(temp)
+#         if decoded_Rdata != None:
+#             print(decoded_Rdata)
+#     else:
+#         ip4 = ip4_string(i.Rdata)
+#         print(ip4)
+#         authorities_list.append(ip4)
+# print("ADDITIONALS")
+# for i in additionals:
+#     print(i)
+#     if (i.RDlen == 4): # filtering for ipv4 addresses
+#         ip4 = ip4_string(i.Rdata)
+#         print(ip4)
+#         authorities_list.append(ip4)
+#     else: # ipv6 addresses
+#         print(ip6_string(i.Rdata))
+
+# unique_authorities =  list(set(authorities_list))
+# print(unique_authorities)
+
+
+# dest = ('205.251.193.129',53)
+# response = send_query(client_socket, query, dest)
+# packet = parse_packet(response)
+# print(packet)
+# header = packet.header
+# questions = packet.questions
+# answers = packet.answers
+# authorities = packet.authorities
+# additionals = packet.additionals
+# authorities_list = []
+# print("HEADER")
+# print(header)
+# print("QUESTIONS")
+# for i in questions:
+#     print(i)
+# print("ANSWERS")
+# for i in answers:
+#     print(i)
+#     ip4 = ip4_string(i.Rdata)
+#     print(ip4)
