@@ -6,6 +6,7 @@ import time
 
 DNS_PORT = 53
 TYPE_A = 1
+TYPE_NS = 2
 CLASS_IN = 1
 #DNS Header
 class Header:
@@ -144,7 +145,7 @@ def create_query(domain_name: str, record_type: int) -> bytes:
     id = random.randint(0, 65535)
     flags = 0 #0 0000 0 0 0 0 000 0000
     header = Header(id = id, flags = flags, QDCOUNT = 1)
-    question = Question(QNAME = name, QTYPE = record_type, QCLASS = 1 )
+    question = Question(QNAME = name, QTYPE = record_type, QCLASS = CLASS_IN )
     query = header_to_bytes(header) + question_to_bytes(question)
     return query
 """
@@ -189,6 +190,13 @@ def decode_domain_name(buffer) -> bytes:
     #buffer.read will eventually reach the terminator byte and end the loop
     return b".".join(chunks)
 """
+Decompresses compressed domain name and parses it. A helper function for decode_domain_name
+
+Args:
+    length: The byte that contains the compression indicator, "11xxxxxx" with x's being 0 or 1
+    buffer: BytesIO object pointer used to read out bytes. Specifically the object that contains the domain name in its byte stream (also where the length came from)
+Return:
+    decoded domain name in bytes or 'Unable to parse' in event of error
 """
 def decode_compressed_domain_name(length, buffer) -> bytes:
     pointer_bytes = bytes([length & 0b00111111]) + buffer.read(1) #OFFSET is 14 bytes total which is why we do (6 + 8)
@@ -202,22 +210,46 @@ def decode_compressed_domain_name(length, buffer) -> bytes:
         return decoded_name
     else:
         return b'Unable to parse'
+"""
+Parses DNS question bytes to a DNS Question object
 
+Args:
+    buffer: BytesIO object pointer used to read out bytes. Contains the bytes of the DNS question
+
+Return:
+    DNS Question object
+"""
 def parse_question(buffer) -> Question:
     name = decode_domain_name(buffer)
-    Qtype = buffer.read(2)
+    Qtype = buffer.read(2) # Type takes two bytes
     Qtype = struct.unpack("!H", Qtype)
-    Qclass = buffer.read(2)
+    Qclass = buffer.read(2) # Class takes two bytes
     Qclass = struct.unpack("!H", Qclass)
     return Question(name, Qtype, Qclass)
+"""
+Parses a single DNS resource record bytes into a Resource_Record object
 
+Args: 
+    BytesIO object pointer used to read out bytes. Contains bytes to the DNS resource record
+
+Return:
+    Resource_Record object
+"""
 def parse_record(buffer) -> Resource_Record:
     name = decode_domain_name(buffer)
     data = buffer.read(10) # 10 because that's how many bytes the rest of the resource record takes up, excluding the RData
     type_, class_, TTL, RDlength = struct.unpack("!HHIH", data)
     record_data = buffer.read(RDlength)
     return Resource_Record(name = name, type = type_, class_data = class_, TTL= TTL, RDlen = RDlength, Rdata = record_data)
+"""
+Parses DNS packet bytes from a server's response into a DNSPacket object
 
+Args:
+    response: Response from server received through Socket's recvfrom
+
+Return:
+    DNSPacket object
+"""
 def parse_packet(response) -> DNSPacket:
     buffer = BytesIO(response)
     header = parse_header(buffer)
@@ -234,30 +266,62 @@ def parse_packet(response) -> DNSPacket:
     for i in range(header.ARCOUNT):
         additionals.append(parse_record(buffer))
     return DNSPacket(header=header, questions=questions, answers=answers, authorities=authorities, additionals=additionals)
+"""
+Changes bytes into a IPv4 string
 
+Args:
+    ip_bytes: IPv4 address in byte form
+
+Return:
+    IPv4 address in string form
+"""
 def ip4_string(ip_bytes) -> str:
     num_list =[]
     for i in ip_bytes:
         num_list.append(str(i))
     return ".".join(num_list)
+"""
+Changes bytes into a IPv6 string
 
+Args:
+    ip_bytes: IPv6 address in byte form
+
+Return:
+    IPv6 address in string form
+"""
 def ip6_string(ip_bytes) -> str:
     hex = ip_bytes.hex()
     parts = [hex[i:i+4] for i in range(0, len(hex), 4)]
     return ":".join(parts)
+"""
+Sends DNS query to specified server
 
+Args:
+    ip_list(list[str]): list of IP addresses to send DNS queries to
+    query(bytes): DNS query structure in byte form
+    socket(socket): socket object that will send DNS query to specified IP address
+    retries: How many times the socket should send to specified IP address when errors, such as timeouts, occur
+return:
+    DNSPacket object 
+"""
 def query_server(ip_list: list[str], query: bytes, socket:socket ,retries=3) -> DNSPacket:
     for ip in ip_list:
         for attempt in range(retries):
             try:
-                socket.sendto(query, (ip, 53))
+                socket.sendto(query, (ip, DNS_PORT))
                 response, addr = socket.recvfrom(4096)
                 packet = parse_packet(response)
                 return packet
             except:
                 print(f"Timeout occured with {ip} in attempt {attempt + 1}")
     return None
-def print_packet(packet):
+"""
+Print the contents of the packet
+
+Args:
+    packet(DNSPacket): packet to print the contents of
+"""
+def print_packet(packet: DNSPacket):
     header = packet.header
     questions = packet.questions
     answers = packet.answers
@@ -276,7 +340,7 @@ def print_packet(packet):
     print("AUTHORITIES")
     for i in authorities:
         print(i)
-        if(i.type ==2 and i.RDlen > 4): # auth.RDlen > 4 to filter out ip addresses labelled with type 2. Also very unlikely a domain name is two letters (1 length byte + 2 char bytes + 1 terminator byte)
+        if(i.type == TYPE_NS and i.RDlen > 4): # auth.RDlen > 4 to filter out ip addresses labelled with type 2. Also very unlikely a domain name is two letters (1 length byte + 2 char bytes + 1 terminator byte)
             temp = BytesIO(i.Rdata)
             #print(bin(int.from_bytes(i.Rdata, byteorder="big")))
             decoded_Rdata = decode_domain_name(temp)
@@ -293,7 +357,15 @@ def print_packet(packet):
             print(ip4)
         else: # ipv6 addresses
             print(ip6_string(i.Rdata))
-def collect_ips(packet) -> list:
+"""
+Collect IP addresses stored in DNS packet
+
+Args: 
+    packet(DNSPacket): packet to extract IP addresses from
+return 
+    list of IP addresses, either the answer section's IP addresses if it is not emtpy, or the Authority/Additional section's IP addresses
+"""
+def collect_ips(packet: DNSPacket) -> list:
     header = packet.header
     questions = packet.questions
     answers = packet.answers
@@ -325,7 +397,7 @@ def collect_ips(packet) -> list:
 
 
 root_servers = ['198.41.0.4', '170.247.170.2', '192.33.4.12', '199.7.91.13', '192.203.230.10', '192.5.5.241', '192.112.36.4', '198.97.190.53']
-query = create_query("tmz.com", 1) # 1 represents the resource record of type A: host address
+query = create_query("tmz.com", TYPE_A) # 1 represents the resource record of type A: host address
 #print(query)
 
 #create socket
